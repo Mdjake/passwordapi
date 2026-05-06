@@ -21,7 +21,7 @@ from typing import Optional, Dict, List
 from datetime import datetime
 from collections import defaultdict
 
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from telethon import TelegramClient, errors
