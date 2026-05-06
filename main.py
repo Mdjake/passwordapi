@@ -1,16 +1,15 @@
 """
-🤖 Telegram Bot Bridge API v2.0.0
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🤖 Telegram Bot Bridge API v2.1.0 - WITH POLLING & EDIT DETECTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Features:
+  - Sends query, then POLLS for bot response
+  - Waits for bot to EDIT message (final version)
+  - Ignores "loading/processing" temporary messages
+  - Returns ONLY the final edited response
   - Multi-user session support
   - Session priority: Environment Variable → SQLite Cloud
-  - Better error handling with retries
   - Rate limiting per user
-  - Request queuing
-  - Smart response matching
-  - Health checks with detailed status
-  - Auto-reconnect on disconnect
-  - Response caching for duplicate queries
+  - Response caching
 """
 
 import os
@@ -24,7 +23,7 @@ from collections import defaultdict
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from telethon import TelegramClient, errors, events
+from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
 import sqlitecloud
 
@@ -37,8 +36,9 @@ SQL_CONN = os.getenv("SQLITE_CLOUD_SESSIONS", "")
 TARGET_BOT = os.getenv("TARGET_BOT", "")
 API_KEY = os.getenv("API_KEY", "")
 RATE_LIMIT = int(os.getenv("RATE_LIMIT_PER_MIN", "30"))
-RESPONSE_TIMEOUT = int(os.getenv("RESPONSE_TIMEOUT_SECONDS", "25"))
+RESPONSE_TIMEOUT = int(os.getenv("RESPONSE_TIMEOUT_SECONDS", "60"))
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "300"))
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL_SECONDS", "1.5"))
 
 # Validate required configs
 if not SQL_CONN:
@@ -55,8 +55,8 @@ logger = logging.getLogger("BridgeAPI")
 
 app = FastAPI(
     title="🤖 Telegram Bot Bridge API",
-    description="Bridge between your API and Telegram Bot with session management",
-    version="2.0.0"
+    description="Bridge between your API and Telegram Bot with polling & edit detection",
+    version="2.1.0"
 )
 
 app.add_middleware(
@@ -197,12 +197,11 @@ class SessionManager:
 session_mgr = SessionManager(SQL_CONN)
 
 # ─────────────────────────────────────────────
-# Telegram Client Manager
+# Telegram Client Manager with POLLING (ONLY AFTER QUERY)
 # ─────────────────────────────────────────────
 class TelegramClientManager:
     def __init__(self):
         self.clients: Dict[str, TelegramClient] = {}
-        self.pending_requests: Dict[str, Dict] = {}
         self._lock = asyncio.Lock()
 
     async def get_client(self, user_id: str = "default") -> Optional[TelegramClient]:
@@ -236,7 +235,6 @@ class TelegramClientManager:
                 logger.error(f"Session invalid for user: {user_id}")
                 return None
             
-            self._setup_handlers(client, user_id)
             self.clients[user_id] = client
             logger.info(f"Client created for user: {user_id}")
             return client
@@ -253,73 +251,106 @@ class TelegramClientManager:
             del self.clients[user_id]
         await self.get_client(user_id)
 
-    def _setup_handlers(self, client: TelegramClient, user_id: str):
-        @client.on(events.MessageEdited(from_users=TARGET_BOT))
-        async def edit_handler(event):
-            await self._handle_response(user_id, event)
-
-        @client.on(events.NewMessage(from_users=TARGET_BOT))
-        async def new_handler(event):
-            await self._handle_response(user_id, event)
-
-    async def _handle_response(self, user_id: str, event):
-        message_text = event.message.text or ""
-        
-        if any(keyword in message_text.lower() for keyword in ['loading', 'processing', 'typing', '...']):
-            return
-        
-        for req_id, data in list(self.pending_requests.items()):
-            if data.get("user_id") != user_id:
-                continue
-                
-            if (event.message.reply_to_msg_id == data.get("sent_msg_id") or
-                event.message.id == data.get("trigger_msg_id")):
-                data["response"] = message_text
-                data["event"].set()
-                logger.info(f"Response captured for request {req_id}")
-
-    async def send_query(self, user_id: str, query: str, timeout: int = RESPONSE_TIMEOUT) -> dict:
+    async def send_query_with_polling(self, user_id: str, query: str, timeout: int = RESPONSE_TIMEOUT) -> dict:
+        """
+        Send query to bot and ONLY THEN start POLLING for response.
+        Waits for bot to EDIT message to final version.
+        Ignores "loading" temporary messages.
+        """
         client = await self.get_client(user_id)
         if not client:
             raise HTTPException(status_code=503, detail=f"No active session for user: {user_id}")
 
-        req_id = str(uuid.uuid4())
-        wait_event = asyncio.Event()
+        start_time = time.time()
         
-        try:
-            sent_msg = await client.send_message(TARGET_BOT, query)
+        # STEP 1: Send the query to bot
+        logger.info(f"📤 Sending query to {TARGET_BOT}: {query}")
+        sent_msg = await client.send_message(TARGET_BOT, query)
+        logger.info(f"📨 Message sent, ID: {sent_msg.id}")
+        
+        # STEP 2: NOW start polling for response (only after query is sent)
+        logger.info(f"🔍 Starting to poll for bot response...")
+        
+        # Track seen messages to avoid duplicates
+        seen_messages = {}
+        last_edited_content = None
+        final_response = None
+        
+        # Poll for response (only runs after query is sent)
+        while time.time() - start_time < timeout:
+            await asyncio.sleep(POLL_INTERVAL)
             
-            self.pending_requests[req_id] = {
-                "user_id": user_id,
-                "event": wait_event,
-                "sent_msg_id": sent_msg.id,
-                "query": query,
-                "timestamp": time.time()
-            }
-            
-            await asyncio.wait_for(wait_event.wait(), timeout=timeout)
-            response = self.pending_requests[req_id].get("response")
-            
+            # Get recent messages from bot (last 10 messages)
+            try:
+                async for msg in client.iter_messages(TARGET_BOT, limit=10):
+                    # Only consider messages that are replies to OUR sent message
+                    if msg.reply_to_msg_id != sent_msg.id:
+                        continue
+                    
+                    msg_id = msg.id
+                    msg_text = msg.text or ""
+                    is_edited = msg.edit_date is not None
+                    
+                    # Skip loading/processing messages
+                    if any(keyword in msg_text.lower() for keyword in ['loading', 'processing', 'typing', '...', 'please wait']):
+                        logger.info(f"⏳ Ignoring loading message: {msg_text[:50]}")
+                        continue
+                    
+                    # First time seeing this message
+                    if msg_id not in seen_messages:
+                        seen_messages[msg_id] = msg_text
+                        
+                        if is_edited or len(msg_text) > 50:
+                            logger.info(f"✏️ Bot sent/edited message (ID: {msg_id}): {msg_text[:100]}")
+                            last_edited_content = msg_text
+                        else:
+                            logger.info(f"📥 Bot responded (ID: {msg_id}): {msg_text[:100]}")
+                            
+                            # If bot replied without editing, this might be final
+                            if not is_edited and len(msg_text) > 20:
+                                final_response = msg_text
+                                break
+                    
+                    # Message content changed (edited)
+                    elif seen_messages[msg_id] != msg_text:
+                        seen_messages[msg_id] = msg_text
+                        logger.info(f"✏️ Bot UPDATED message (ID: {msg_id}): {msg_text[:100]}")
+                        last_edited_content = msg_text
+                        
+                        # If this looks like final response
+                        if len(msg_text) > 30 and any(c in msg_text for c in ['.', ':', '\n', '-']):
+                            final_response = msg_text
+                            break
+                
+                # If we have a final response, return it immediately
+                if final_response:
+                    logger.info(f"✅ Final response captured: {final_response[:100]}")
+                    return {
+                        "success": True,
+                        "query": query,
+                        "response": final_response,
+                        "response_time": round(time.time() - start_time, 2),
+                        "method": "polling"
+                    }
+                
+            except Exception as e:
+                logger.error(f"Error polling messages: {e}")
+                continue
+        
+        # Timeout reached - return last edited content if exists
+        if last_edited_content:
+            logger.info(f"⚠️ Timeout but returning last edited content")
             return {
                 "success": True,
-                "request_id": req_id,
                 "query": query,
-                "response": response,
-                "response_time": round(time.time() - self.pending_requests[req_id]["timestamp"], 2)
+                "response": last_edited_content,
+                "response_time": round(time.time() - start_time, 2),
+                "method": "polling_timeout",
+                "warning": "Response may be incomplete (timeout)"
             }
-            
-        except asyncio.TimeoutError:
-            logger.warning(f"Timeout for request {req_id} from user {user_id}")
-            raise HTTPException(status_code=408, detail="Bot response timeout")
-        except errors.FloodWaitError as e:
-            logger.warning(f"Flood wait for user {user_id}: {e.seconds}s")
-            raise HTTPException(status_code=429, detail=f"Rate limited. Try again in {e.seconds} seconds")
-        except Exception as e:
-            logger.error(f"Error sending query: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-        finally:
-            if req_id in self.pending_requests:
-                del self.pending_requests[req_id]
+        
+        # No response at all
+        raise HTTPException(status_code=408, detail="Bot did not respond within timeout")
 
     async def cleanup(self):
         for user_id, client in self.clients.items():
@@ -345,9 +376,11 @@ async def verify_api_key(api_key: Optional[str] = Query(None)):
 
 @app.on_event("startup")
 async def startup():
-    logger.info(f"🚀 Starting Telegram Bridge API v2.0.0")
-    logger.info(f"Target Bot: {TARGET_BOT}")
-    logger.info(f"Response Timeout: {RESPONSE_TIMEOUT}s")
+    logger.info(f"🚀 Starting Telegram Bridge API v2.1.0 (POLLING MODE)")
+    logger.info(f"🎯 Target Bot: {TARGET_BOT}")
+    logger.info(f"⏱️ Response Timeout: {RESPONSE_TIMEOUT}s")
+    logger.info(f"🔄 Poll Interval: {POLL_INTERVAL}s")
+    logger.info(f"📋 Polling starts ONLY after query is sent")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -362,12 +395,17 @@ async def send_query_post(
     timeout: int = RESPONSE_TIMEOUT,
     api_key: Optional[str] = Query(None)
 ):
+    """
+    Send a query to Telegram bot and wait for response.
+    Bot can take time to respond - this waits for the final edited version.
+    Polling ONLY starts AFTER the query is sent.
+    """
     # Verify API key
     if API_KEY and api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
     
     # Validate timeout
-    if timeout < 5 or timeout > 60:
+    if timeout < 5 or timeout > 120:
         timeout = RESPONSE_TIMEOUT
     
     # Rate limiting
@@ -387,8 +425,8 @@ async def send_query_post(
                 "rate_remaining": remaining
             }
     
-    # Send to bot
-    result = await tg_manager.send_query(user_id, query, timeout)
+    # Send to bot with polling (polling starts ONLY after query sent)
+    result = await tg_manager.send_query_with_polling(user_id, query, timeout)
     result["cached"] = False
     result["rate_remaining"] = remaining
     
@@ -420,6 +458,8 @@ async def register_session(
         raise HTTPException(status_code=401, detail="Invalid API key")
     
     session_mgr.save_session(user_id, session_string, phone_number)
+    
+    # Test the session
     client = await tg_manager.get_client(user_id)
     if not client:
         raise HTTPException(status_code=400, detail="Invalid session string")
@@ -448,13 +488,15 @@ async def health_check():
     
     return {
         "status": "online",
-        "version": "2.0.0",
+        "version": "2.1.0",
+        "mode": "polling (starts only after query)",
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "clients_connected": len(tg_manager.clients),
         "clients_detail": clients_status,
-        "pending_requests": len(tg_manager.pending_requests),
         "cache_stats": cache.stats(),
-        "target_bot": TARGET_BOT
+        "target_bot": TARGET_BOT,
+        "poll_interval": POLL_INTERVAL,
+        "timeout": RESPONSE_TIMEOUT
     }
 
 @app.get("/metrics")
@@ -465,19 +507,29 @@ async def get_metrics(api_key: Optional[str] = Query(None)):
     return {
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "active_clients": len(tg_manager.clients),
-        "pending_requests": len(tg_manager.pending_requests),
         "cache": cache.stats(),
         "rate_limiter": {
             "limit_per_minute": RATE_LIMIT,
             "active_users": len(rate_limiter._requests)
+        },
+        "config": {
+            "poll_interval": POLL_INTERVAL,
+            "timeout": RESPONSE_TIMEOUT
         }
     }
 
 @app.get("/")
 async def root():
     return {
-        "api": "🤖 Telegram Bot Bridge API",
-        "version": "2.0.0",
+        "api": "🤖 Telegram Bot Bridge API v2.1.0",
+        "mode": "polling - starts ONLY AFTER query is sent",
+        "how_it_works": {
+            "step_1": "Send query to bot",
+            "step_2": "THEN start polling for response (not before)",
+            "step_3": "Ignore 'loading/processing' messages",
+            "step_4": "Wait for bot to EDIT message to final version",
+            "step_5": "Return the final response"
+        },
         "endpoints": {
             "send_query": "GET /query?query=hello&user_id=default&api_key=YOUR_KEY",
             "register_session": "POST /session/register?user_id=me&session_string=...&api_key=YOUR_KEY",
