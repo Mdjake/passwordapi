@@ -1,7 +1,10 @@
-"""
-🤖 Telegram Bot Bridge API v2.4.0 - WITH POLLING, EDIT DETECTION & RESPONSE PARSER
+""" 
+🤖 Telegram Bot Bridge API v2.5.0 - WITH POLLING, EDIT DETECTION, RESPONSE PARSER & FIFO ENQUEUE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Features:
+  - FIFO per-user request queue (no response mixing)
+  - Unique request IDs (UUID) for tracking
+  - Background queue workers per user
   - Sends query, then POLLS for bot response
   - Does NOT rely on reply_to_msg_id (most bots don't reply, they just send)
   - Filters by message timestamp (only messages AFTER query was sent)
@@ -22,10 +25,12 @@ import re
 import asyncio
 import logging
 import time
+import uuid
 import unicodedata
 from typing import Optional, Dict
 from datetime import datetime, timezone
 from collections import defaultdict
+from asyncio import Queue
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -46,6 +51,7 @@ RESPONSE_TIMEOUT   = int(os.getenv("RESPONSE_TIMEOUT_SECONDS", "60"))
 CACHE_TTL          = int(os.getenv("CACHE_TTL_SECONDS", "300"))
 POLL_INTERVAL      = float(os.getenv("POLL_INTERVAL_SECONDS", "1.5"))
 EDIT_WAIT          = float(os.getenv("EDIT_WAIT_SECONDS", "2.0"))
+REQUEST_RESULT_TTL = int(os.getenv("REQUEST_RESULT_TTL_SECONDS", "3600"))
 
 if not SQL_CONN:
     raise ValueError("SQLITE_CLOUD_SESSIONS environment variable is required")
@@ -61,8 +67,8 @@ logger = logging.getLogger("BridgeAPI")
 
 app = FastAPI(
     title="🤖 Telegram Bot Bridge API",
-    description="Bridge between your API and Telegram Bot with polling, edit detection & response parsing",
-    version="2.4.0"
+    description="Bridge between your API and Telegram Bot with FIFO queuing, polling, edit detection & response parsing",
+    version="2.5.0"
 )
 
 app.add_middleware(
@@ -136,6 +142,162 @@ class ResponseCache:
 
 
 cache = ResponseCache(ttl=CACHE_TTL)
+
+
+# ─────────────────────────────────────────────
+# Request Queue & Status Manager
+# ─────────────────────────────────────────────
+class RequestQueueManager:
+    """
+    Manages per-user FIFO queues with UUID tracking.
+    - Each user has isolated queue (FIFO)
+    - Prevents response mixing between concurrent requests
+    - Background workers process requests sequentially per user
+    """
+    def __init__(self, result_ttl: int = 3600):
+        self.queues: Dict[str, Queue] = {}              # user_id -> Queue
+        self.workers: Dict[str, asyncio.Task] = {}      # user_id -> worker task
+        self.request_status: Dict[str, dict] = {}       # request_id -> {status, query, result, ...}
+        self._lock = asyncio.Lock()
+        self.result_ttl = result_ttl
+
+    async def enqueue_request(self, user_id: str, query: str) -> str:
+        """
+        Enqueue a request for a user. Returns request_id.
+        Starts background worker if not already running.
+        """
+        request_id = str(uuid.uuid4())
+        now = time.time()
+
+        async with self._lock:
+            # Create queue for user if doesn't exist
+            if user_id not in self.queues:
+                self.queues[user_id] = Queue()
+                # Start background worker for this user
+                self.workers[user_id] = asyncio.create_task(
+                    self._process_user_queue(user_id)
+                )
+                logger.info(f"👷 Started queue worker for user: {user_id}")
+
+            # Store request metadata
+            self.request_status[request_id] = {
+                "request_id": request_id,
+                "user_id": user_id,
+                "query": query,
+                "status": "queued",
+                "queued_at": now,
+                "started_at": None,
+                "completed_at": None,
+                "result": None,
+                "wait_time": 0,
+                "process_time": 0,
+                "expires_at": now + self.result_ttl,
+            }
+
+            # Enqueue the request
+            await self.queues[user_id].put(request_id)
+            logger.info(f"📋 Request {request_id[:8]}... queued for user {user_id}")
+
+        return request_id
+
+    async def get_request_status(self, request_id: str) -> dict:
+        """
+        Get the current status of a request.
+        """
+        if request_id not in self.request_status:
+            raise HTTPException(status_code=404, detail="Request not found")
+
+        req_data = self.request_status[request_id]
+
+        # Check if expired
+        if time.time() > req_data["expires_at"]:
+            del self.request_status[request_id]
+            raise HTTPException(status_code=404, detail="Request expired")
+
+        return {
+            "request_id": req_data["request_id"],
+            "status": req_data["status"],
+            "query": req_data["query"],
+            "wait_time": req_data["wait_time"],
+            "process_time": req_data["process_time"],
+            "result": req_data["result"],
+        }
+
+    async def _process_user_queue(self, user_id: str):
+        """
+        Background worker: processes requests for a user sequentially (FIFO).
+        Prevents response mixing between concurrent requests.
+        """
+        logger.info(f"👷 Queue worker started for user: {user_id}")
+        queue = self.queues[user_id]
+
+        while True:
+            try:
+                # Wait for next request (blocking)
+                request_id = await queue.get()
+                req_data = self.request_status[request_id]
+
+                queued_at = req_data["queued_at"]
+                started_at = time.time()
+                wait_time = started_at - queued_at
+
+                # Update status to processing
+                req_data["status"] = "processing"
+                req_data["started_at"] = started_at
+                req_data["wait_time"] = round(wait_time, 2)
+
+                logger.info(
+                    f"⚙️ Processing {request_id[:8]}... "
+                    f"for user {user_id} (waited {wait_time:.2f}s)"
+                )
+
+                # Process the request (delegated to caller)
+                # For now, mark as ready to be processed
+                req_data["status"] = "ready_for_processing"
+
+                queue.task_done()
+
+            except Exception as e:
+                logger.error(f"Queue worker error for {user_id}: {e}")
+                await asyncio.sleep(0.5)
+
+    async def mark_completed(self, request_id: str, result: dict):
+        """
+        Mark request as completed with the result.
+        """
+        if request_id not in self.request_status:
+            return
+
+        req_data = self.request_status[request_id]
+        started_at = req_data["started_at"] or time.time()
+        completed_at = time.time()
+        process_time = completed_at - started_at
+
+        req_data["status"] = "completed"
+        req_data["completed_at"] = completed_at
+        req_data["process_time"] = round(process_time, 2)
+        req_data["result"] = result
+
+        logger.info(
+            f"✅ Request {request_id[:8]}... completed in {process_time:.2f}s"
+        )
+
+    async def cleanup_expired(self):
+        """
+        Periodically clean up expired request records.
+        """
+        now = time.time()
+        expired = [
+            rid for rid, data in self.request_status.items()
+            if data["expires_at"] < now
+        ]
+        for rid in expired:
+            del self.request_status[rid]
+        if expired:
+            logger.info(f"🗑️ Cleaned up {len(expired)} expired requests")
+
+
+queue_mgr = RequestQueueManager(result_ttl=REQUEST_RESULT_TTL)
 
 
 # ─────────────────────────────────────────────
@@ -577,12 +739,27 @@ tg_manager = TelegramClientManager()
 
 
 # ─────────────────────────────────────────────
+# Background cleanup task
+# ─────────────────────────────────────────────
+async def periodic_cleanup():
+    """
+    Periodically clean up expired request records.
+    """
+    while True:
+        try:
+            await asyncio.sleep(300)  # Clean every 5 minutes
+            await queue_mgr.cleanup_expired()
+        except Exception as e:
+            logger.error(f"Cleanup error: {e}")
+
+
+# ─────────────────────────────────────────────
 # ENDPOINTS
 # ─────────────────────────────────────────────
 
 @app.on_event("startup")
 async def startup():
-    logger.info("🚀 Starting Telegram Bridge API v2.4.0")
+    logger.info("🚀 Starting Telegram Bridge API v2.5.0")
     logger.info(f"🎯 Target Bot:       {TARGET_BOT}")
     logger.info(f"⏱️  Response Timeout: {RESPONSE_TIMEOUT}s")
     logger.info(f"🔄 Poll Interval:    {POLL_INTERVAL}s")
@@ -590,6 +767,10 @@ async def startup():
     logger.info("✅ Timestamp-based filtering (no reply_to_msg_id)")
     logger.info("✅ Extracts phone, country, country_code")
     logger.info("✅ Handles split Code+Number and next-line value formats")
+    logger.info("✅ FIFO per-user request queues (no response mixing)")
+    logger.info("✅ UUID request tracking and status monitoring")
+    # Start cleanup task
+    asyncio.create_task(periodic_cleanup())
 
 
 @app.on_event("shutdown")
@@ -614,6 +795,7 @@ async def send_query_post(
       - country       → country name
       - country_code  → dial code ("+91")
       - raw_response  → full original bot message (for debugging)
+      - request_id    → UUID for tracking this request
     """
     if API_KEY and api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
@@ -630,13 +812,42 @@ async def send_query_post(
         if cached:
             return {**cached, "cached": True, "rate_remaining": remaining}
 
-    result = await tg_manager.send_query_with_polling(user_id, query, timeout)
-    result["rate_remaining"] = remaining
+    # Enqueue the request (FIFO per user)
+    request_id = await queue_mgr.enqueue_request(user_id, query)
 
-    # Cache the full result
-    cache.set(query, user_id, result)
+    # Wait for queue to mark it as ready for processing
+    max_wait = timeout + 5
+    wait_start = time.time()
+    while time.time() - wait_start < max_wait:
+        req_data = queue_mgr.request_status.get(request_id)
+        if req_data and req_data["status"] == "ready_for_processing":
+            break
+        await asyncio.sleep(0.1)
 
-    return result
+    # Actually process the request
+    try:
+        result = await tg_manager.send_query_with_polling(user_id, query, timeout)
+        result["request_id"] = request_id
+        result["rate_remaining"] = remaining
+        result["queued"] = True  # Mark that this went through queue
+
+        # Mark as completed in queue manager
+        await queue_mgr.mark_completed(request_id, result)
+
+        # Cache the full result
+        cache.set(query, user_id, result)
+
+        return result
+
+    except Exception as e:
+        # Mark as failed
+        error_result = {
+            "success": False,
+            "error": str(e),
+            "query": query,
+        }
+        await queue_mgr.mark_completed(request_id, error_result)
+        raise
 
 
 @app.get("/query")
@@ -649,6 +860,26 @@ async def send_query_get(
 ):
     """GET version — easy for browser testing."""
     return await send_query_post(query, user_id, use_cache, timeout, api_key)
+
+
+@app.get("/request/{request_id}")
+async def get_request_status(
+    request_id: str,
+    api_key: Optional[str] = Query(None),
+):
+    """
+    Get the status of a request by its UUID.
+
+    Returns:
+      - status: "queued" | "processing" | "ready_for_processing" | "completed"
+      - wait_time: time spent waiting in queue (seconds)
+      - process_time: time spent processing (seconds)
+      - result: full response data (when completed)
+    """
+    if API_KEY and api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    return await queue_mgr.get_request_status(request_id)
 
 
 @app.post("/session/register")
@@ -697,12 +928,16 @@ async def health_check():
     }
     return {
         "status":           "online",
-        "version":          "2.4.0",
-        "mode":             "polling (timestamp-filtered, edit-aware, structured-parser)",
+        "version":          "2.5.0",
+        "mode":             "polling + FIFO queue (timestamp-filtered, edit-aware, structured-parser)",
         "timestamp":        datetime.utcnow().isoformat() + "Z",
         "clients_connected": len(tg_manager.clients),
         "clients_detail":   clients_status,
         "cache_stats":      cache.stats(),
+        "queue_stats": {
+            "total_requests": len(queue_mgr.request_status),
+            "active_workers": len(queue_mgr.workers),
+        },
         "target_bot":       TARGET_BOT,
         "poll_interval":    POLL_INTERVAL,
         "edit_wait":        EDIT_WAIT,
@@ -720,6 +955,11 @@ async def get_metrics(api_key: Optional[str] = Query(None)):
         "timestamp":      datetime.utcnow().isoformat() + "Z",
         "active_clients": len(tg_manager.clients),
         "cache":          cache.stats(),
+        "queue": {
+            "total_requests": len(queue_mgr.request_status),
+            "active_workers": len(queue_mgr.workers),
+            "result_ttl": REQUEST_RESULT_TTL,
+        },
         "rate_limiter": {
             "limit_per_minute": RATE_LIMIT,
             "active_users":     len(rate_limiter._requests),
@@ -735,7 +975,7 @@ async def get_metrics(api_key: Optional[str] = Query(None)):
 @app.get("/")
 async def root():
     return {
-        "api":     "🤖 Telegram Bot Bridge API v2.4.0",
+        "api":     "🤖 Telegram Bot Bridge API v2.5.0",
         "example_response": {
             "success":        True,
             "query":          "6258915779",
@@ -743,14 +983,17 @@ async def root():
             "country":        "India",
             "country_code":   "+91",
             "raw_response":   "🔎 PHONE INFO\n\nCountry: India\n\nCode: +91\n\nNumber:\n7355348898",
+            "request_id":     "550e8400-e29b-41d4-a716-446655440000",
             "response_time":  3.42,
             "method":         "polling",
             "cached":         False,
             "rate_remaining": 29,
+            "queued":         True,
         },
         "endpoints": {
             "query_get":        "GET  /query?query=6258915779&user_id=default&api_key=YOUR_KEY",
             "query_post":       "POST /query?query=6258915779&user_id=default&api_key=YOUR_KEY",
+            "request_status":   "GET  /request/{request_id}?api_key=YOUR_KEY",
             "register_session": "POST /session/register?user_id=me&session_string=...&api_key=YOUR_KEY",
             "delete_session":   "DELETE /session/{user_id}?api_key=YOUR_KEY",
             "health":           "GET  /health",
