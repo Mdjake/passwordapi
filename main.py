@@ -18,13 +18,12 @@ import asyncio
 import logging
 import time
 import uuid
-from typing import Optional, Dict, List
+from typing import Optional, Dict
 from datetime import datetime
 from collections import defaultdict
 
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Depends
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from telethon import TelegramClient, errors, events
 from telethon.sessions import StringSession
 import sqlitecloud
@@ -36,11 +35,10 @@ API_ID = int(os.getenv("TG_API_ID", "123456"))
 API_HASH = os.getenv("TG_API_HASH", "your_hash")
 SQL_CONN = os.getenv("SQLITE_CLOUD_SESSIONS", "")
 TARGET_BOT = os.getenv("TARGET_BOT", "")
-API_KEY = os.getenv("API_KEY", "")  # Optional: Add API key auth
+API_KEY = os.getenv("API_KEY", "")
 RATE_LIMIT = int(os.getenv("RATE_LIMIT_PER_MIN", "30"))
 RESPONSE_TIMEOUT = int(os.getenv("RESPONSE_TIMEOUT_SECONDS", "25"))
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
-CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "300"))  # Cache responses for 5min
+CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "300"))
 
 # Validate required configs
 if not SQL_CONN:
@@ -162,7 +160,6 @@ class SessionManager:
                     (user_id,)
                 ).fetchone()
                 if res:
-                    # Update last_used
                     conn.execute(
                         "UPDATE sessions SET last_used = CURRENT_TIMESTAMP WHERE user_id = ?",
                         (user_id,)
@@ -200,7 +197,7 @@ class SessionManager:
 session_mgr = SessionManager(SQL_CONN)
 
 # ─────────────────────────────────────────────
-# Telegram Client Manager (Fixed)
+# Telegram Client Manager
 # ─────────────────────────────────────────────
 class TelegramClientManager:
     def __init__(self):
@@ -218,10 +215,9 @@ class TelegramClientManager:
                     await self._reconnect_client(user_id)
                     return self.clients.get(user_id)
             
-            # SESSION PRIORITY: Environment Variable FIRST, then SQLite Cloud
+            # Session priority: Env variable FIRST, then SQLite Cloud
             session_str = os.getenv(f"SESSION_STRING_{user_id.upper()}")
             
-            # If not in Env, try to get from SQLite Cloud
             if not session_str:
                 session_str = session_mgr.get_session(user_id)
             
@@ -267,19 +263,15 @@ class TelegramClientManager:
             await self._handle_response(user_id, event)
 
     async def _handle_response(self, user_id: str, event):
-        """Handle incoming responses from bot"""
         message_text = event.message.text or ""
         
-        # Check for loading/processing messages - ignore them
         if any(keyword in message_text.lower() for keyword in ['loading', 'processing', 'typing', '...']):
             return
         
-        # Find matching pending request
         for req_id, data in list(self.pending_requests.items()):
             if data.get("user_id") != user_id:
                 continue
                 
-            # Match by reply_to or trigger message
             if (event.message.reply_to_msg_id == data.get("sent_msg_id") or
                 event.message.id == data.get("trigger_msg_id")):
                 data["response"] = message_text
@@ -295,7 +287,6 @@ class TelegramClientManager:
         wait_event = asyncio.Event()
         
         try:
-            # Send message to bot
             sent_msg = await client.send_message(TARGET_BOT, query)
             
             self.pending_requests[req_id] = {
@@ -306,7 +297,6 @@ class TelegramClientManager:
                 "timestamp": time.time()
             }
             
-            # Wait for response
             await asyncio.wait_for(wait_event.wait(), timeout=timeout)
             response = self.pending_requests[req_id].get("response")
             
@@ -342,7 +332,7 @@ class TelegramClientManager:
 tg_manager = TelegramClientManager()
 
 # ─────────────────────────────────────────────
-# API KEY DEPENDENCY (Optional)
+# API KEY VERIFICATION
 # ─────────────────────────────────────────────
 async def verify_api_key(api_key: Optional[str] = Query(None)):
     if API_KEY and api_key != API_KEY:
@@ -364,21 +354,22 @@ async def shutdown():
     logger.info("🛑 Shutting down, cleaning up clients...")
     await tg_manager.cleanup()
 
-@app.post("/query", tags=["Core"])
-async def send_query(
+@app.post("/query")
+async def send_query_post(
     query: str,
-    user_id: str = Query("default", description="User session ID"),
-    use_cache: bool = Query(True, description="Use cached response if available"),
-    timeout: int = Query(RESPONSE_TIMEOUT, ge=5, le=60, description="Response timeout seconds"),
-    _: str = Depends(verify_api_key)
+    user_id: str = "default",
+    use_cache: bool = True,
+    timeout: int = RESPONSE_TIMEOUT,
+    api_key: Optional[str] = Query(None)
 ):
-    """
-    Send a query to Telegram bot and wait for response.
+    # Verify API key
+    if API_KEY and api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
     
-    - **query**: Your question/message to the bot
-    - **user_id**: Unique identifier for session (default: "default")
-    - **use_cache**: Return cached response for duplicate queries
-    """
+    # Validate timeout
+    if timeout < 5 or timeout > 60:
+        timeout = RESPONSE_TIMEOUT
+    
     # Rate limiting
     allowed, remaining = rate_limiter.is_allowed(user_id)
     if not allowed:
@@ -407,47 +398,50 @@ async def send_query(
     
     return result
 
-@app.get("/query", tags=["Core"])
+@app.get("/query")
 async def send_query_get(
     query: str = Query(..., description="Your question"),
-    user_id: str = Query("default"),
-    use_cache: bool = Query(True),
+    user_id: str = "default",
+    use_cache: bool = True,
+    timeout: int = RESPONSE_TIMEOUT,
     api_key: Optional[str] = Query(None)
 ):
-    """GET version of /query - easy for browser testing"""
-    return await send_query(query, user_id, use_cache, _=api_key)
+    """GET version - easy for browser testing"""
+    return await send_query_post(query, user_id, use_cache, timeout, api_key)
 
-@app.post("/session/register", tags=["Session"])
+@app.post("/session/register")
 async def register_session(
     user_id: str,
     session_string: str,
     phone_number: Optional[str] = None,
     api_key: Optional[str] = Query(None)
 ):
-    """
-    Register a new Telegram session for a user.
-    Get session_string from: https://replit.com/@zaidalkazaz/GenerateStringSession
-    """
+    if API_KEY and api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
     session_mgr.save_session(user_id, session_string, phone_number)
-    # Test the session by creating client
     client = await tg_manager.get_client(user_id)
     if not client:
         raise HTTPException(status_code=400, detail="Invalid session string")
     
     return {"success": True, "message": f"Session registered for {user_id}"}
 
-@app.delete("/session/{user_id}", tags=["Session"])
-async def delete_session(user_id: str, api_key: Optional[str] = Query(None)):
-    """Delete a user's session"""
+@app.delete("/session/{user_id}")
+async def delete_session(
+    user_id: str, 
+    api_key: Optional[str] = Query(None)
+):
+    if API_KEY and api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
     session_mgr.delete_session(user_id)
     if user_id in tg_manager.clients:
         await tg_manager.clients[user_id].disconnect()
         del tg_manager.clients[user_id]
     return {"success": True, "message": f"Session deleted for {user_id}"}
 
-@app.get("/health", tags=["Info"])
+@app.get("/health")
 async def health_check():
-    """Detailed health status"""
     clients_status = {}
     for user_id, client in tg_manager.clients.items():
         clients_status[user_id] = client.is_connected()
@@ -463,9 +457,11 @@ async def health_check():
         "target_bot": TARGET_BOT
     }
 
-@app.get("/metrics", tags=["Info"])
+@app.get("/metrics")
 async def get_metrics(api_key: Optional[str] = Query(None)):
-    """Detailed metrics for monitoring"""
+    if API_KEY and api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
     return {
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "active_clients": len(tg_manager.clients),
@@ -477,16 +473,16 @@ async def get_metrics(api_key: Optional[str] = Query(None)):
         }
     }
 
-@app.get("/", tags=["Info"])
+@app.get("/")
 async def root():
     return {
         "api": "🤖 Telegram Bot Bridge API",
         "version": "2.0.0",
         "endpoints": {
-            "send_query": "POST/GET /query?query=hello&user_id=default",
-            "register_session": "POST /session/register?user_id=me&session_string=...",
+            "send_query": "GET /query?query=hello&user_id=default&api_key=YOUR_KEY",
+            "register_session": "POST /session/register?user_id=me&session_string=...&api_key=YOUR_KEY",
             "health": "GET /health",
-            "metrics": "GET /metrics"
+            "metrics": "GET /metrics?api_key=YOUR_KEY"
         },
         "docs": "/docs"
     }
