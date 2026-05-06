@@ -489,10 +489,10 @@ class TelegramClientManager:
                                 "success":       True,
                                 "query":         query,
                                 **parsed,
-                                "raw_response":  msg_text,
+                                "Developer":  "i_AmAnanya",
                                 "response_time": round(time.time() - start_ts, 2),
                                 "method":        "polling",
-                                "cached":        False,
+                                "cached":        False
                             }
 
                     else:
@@ -534,7 +534,7 @@ class TelegramClientManager:
                             "success":       True,
                             "query":         query,
                             **parsed,
-                            "raw_response":  final_response,
+                            "Deveoper":  "@i_AmAnanya",
                             "response_time": round(time.time() - start_ts, 2),
                             "method":        "polling_edited",
                             "cached":        False,
