@@ -295,7 +295,9 @@ class TelegramClientManager:
 
         LOADING_KEYWORDS = [
             "loading", "processing", "typing", "please wait",
-            "⏳", "🔄", "generating", "thinking"
+            "⏳", "🔄", "generating", "thinking",
+            "searching", "searching for data", "fetching", "looking up",
+            "retrieving", "please hold", "working on it"
         ]
 
         def is_loading(text: str) -> bool:
