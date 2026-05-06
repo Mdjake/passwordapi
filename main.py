@@ -207,41 +207,29 @@ class TelegramClientManager:
         self.pending_requests: Dict[str, Dict] = {}
         self._lock = asyncio.Lock()
 
-    async def get_client(self, user_id: str = "default") -> Optional[TelegramClient]:
+        async def get_client(self, user_id: str = "default") -> Optional[TelegramClient]:
         async with self._lock:
             if user_id in self.clients:
                 client = self.clients[user_id]
                 if client.is_connected():
                     return client
                 else:
-                    # Reconnect
                     await self._reconnect_client(user_id)
                     return self.clients.get(user_id)
             
-            # Create new client
-            session_str = session_mgr.get_session(user_id)
+            # 1. Try to get session from Environment Variable FIRST
+            session_str = os.getenv(f"SESSION_STRING_{user_id.upper()}")
+            
+            # 2. If not in Env, try to get from SQLite Cloud
+            if not session_str:
+                session_str = session_mgr.get_session(user_id)
+            
             if not session_str:
                 logger.warning(f"No session found for user: {user_id}")
                 return None
             
             return await self._create_client(user_id, session_str)
 
-    async def _create_client(self, user_id: str, session_str: str) -> Optional[TelegramClient]:
-        try:
-            client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-            await client.connect()
-            
-            if not await client.is_user_authorized():
-                logger.error(f"Session invalid for user: {user_id}")
-                return None
-            
-            self._setup_handlers(client, user_id)
-            self.clients[user_id] = client
-            logger.info(f"Client created for user: {user_id}")
-            return client
-        except Exception as e:
-            logger.error(f"Failed to create client for {user_id}: {e}")
-            return None
 
     async def _reconnect_client(self, user_id: str):
         if user_id in self.clients:
