@@ -7,7 +7,7 @@ Features:
   - Filters by message timestamp (only messages AFTER query was sent)
   - Waits for bot to EDIT message (final version)
   - Ignores "loading/processing/searching" temporary messages
-  - Extracts phone, display_phone, country, country_code, input from bot responses
+  - Extracts phone, country, country_code from bot responses
   - Handles split "Code: +91 / Number: 7355348898" formats
   - Handles next-line values ("Number:\\n7355348898")
   - Returns clean structured JSON with all extracted fields
@@ -242,29 +242,21 @@ def parse_bot_response(text: str) -> dict:
       📞 Phone: +91 7355348898
       🌍 Country: India
       Code: +91
-      Number:
-      7355348898              ← value on the very next line
-      Input:
-      6258915779
-      📞Phone:+919709211448   ← no spaces
+      Number: 7355348898
 
     Returns:
       {
         "phone":         "+917355348898",    # E.164-ish, no spaces
-        "display_phone": "+91 7355348898",   # as-is from bot
         "country":       "India",
         "country_code":  "+91",
-        "input":         "6258915779",
         "extra":         { ...any other key:value pairs... }
       }
     All fields default to None / {} when not found.
     """
     result: dict = {
         "phone":         None,
-        "display_phone": None,
         "country":       None,
         "country_code":  None,
-        "input":         None,
         "extra":         {},
     }
 
@@ -296,7 +288,6 @@ def parse_bot_response(text: str) -> dict:
 
         # ── Map to known fields ──────────────────────────────────────────
         if key in ('phone', 'mobile', 'number', 'no', 'ph'):
-            result['display_phone'] = val
             # Normalise: keep leading +, strip spaces / dashes / dots / parens
             result['phone'] = re.sub(r'[\s\-().]', '', val)
 
@@ -307,7 +298,8 @@ def parse_bot_response(text: str) -> dict:
             result['country_code'] = val
 
         elif key in ('input', 'query', 'searched', 'search'):
-            result['input'] = val
+            # Skip input fields entirely
+            pass
 
         else:
             # Preserve any other key:value the bot may send
@@ -326,7 +318,6 @@ def parse_bot_response(text: str) -> dict:
             code    = result['country_code'].strip()
             num     = re.sub(r'[\s\-]', '', number)
             result['phone']         = code + num
-            result['display_phone'] = f"{code} {number}"
 
     # Drop empty extra dict to keep response clean
     if not result['extra']:
@@ -597,7 +588,7 @@ async def startup():
     logger.info(f"🔄 Poll Interval:    {POLL_INTERVAL}s")
     logger.info(f"✏️  Edit Wait:        {EDIT_WAIT}s")
     logger.info("✅ Timestamp-based filtering (no reply_to_msg_id)")
-    logger.info("✅ Extracts phone, display_phone, country, country_code, input")
+    logger.info("✅ Extracts phone, country, country_code")
     logger.info("✅ Handles split Code+Number and next-line value formats")
 
 
@@ -620,10 +611,8 @@ async def send_query_post(
 
     Returns clean structured JSON:
       - phone         → E.164-normalised number ("+917355348898")
-      - display_phone → as received from bot ("+91 7355348898")
       - country       → country name
       - country_code  → dial code ("+91")
-      - input         → the input number the bot echoed back
       - raw_response  → full original bot message (for debugging)
     """
     if API_KEY and api_key != API_KEY:
@@ -751,11 +740,9 @@ async def root():
             "success":        True,
             "query":          "6258915779",
             "phone":          "+917355348898",
-            "display_phone":  "+91 7355348898",
             "country":        "India",
             "country_code":   "+91",
-            "input":          "6258915779",
-            "raw_response":   "🔎 PHONE INFO\n\nInput:\n6258915779\n\nCountry: India\n\nCode: +91\n\nNumber:\n7355348898",
+            "raw_response":   "🔎 PHONE INFO\n\nCountry: India\n\nCode: +91\n\nNumber:\n7355348898",
             "response_time":  3.42,
             "method":         "polling",
             "cached":         False,
